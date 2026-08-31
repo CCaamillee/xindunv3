@@ -8,3 +8,6 @@ __pycache__/
 *.xls
 *.jsonl
 model-results/
+chat_history.db
+chat_history.db-wal
+chat_history.db-shm

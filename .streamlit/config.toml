@@ -33,3 +33,4 @@ disableDataExport = true
 
 [server]
 headless = true
+fileWatcherType = "none"

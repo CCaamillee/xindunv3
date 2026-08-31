@@ -12,7 +12,7 @@ import streamlit as st
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_WORKBOOK_PATH = PROJECT_ROOT / "clean_非破裂完整版（15天窗口）.xlsx"
+DEFAULT_WORKBOOK_PATH = PROJECT_ROOT / "clean_心脏破裂完整版（15天窗口）.xlsx"
 SOURCE_NAME = DEFAULT_WORKBOOK_PATH.name
 
 DIAGNOSIS_COLUMNS = (

@@ -7,6 +7,15 @@ import streamlit as st
 
 from components.cards import render_profile_strip, risk_badge
 from components.header import render_header
+from components.react_chat import (
+    TOOL_LABELS,
+    inject_react_chat_styles,
+    partial_model_answer,
+    partial_model_thinking,
+    restored_timeline_steps,
+    source_strip_html,
+    timeline_html,
+)
 from components.patient_navigation import (
     consume_pending_encounter_key,
     navigate_to_patient_page,
@@ -14,6 +23,11 @@ from components.patient_navigation import (
 )
 from components.records import render_record_cards
 from agent.react_agent import ClinicalReActAgent
+from services.chat_store import (
+    append_chat_message,
+    clear_encounter_chat,
+    load_encounter_chat,
+)
 from services.prediction_api import get_prediction_for_encounter, normalize_live_prediction
 from services.workbook_data import get_encounter_dataframe, get_encounter_detail
 
@@ -22,7 +36,7 @@ SUGGESTIONS = {
     "核对诊断与主要病历": "请核对当前就诊中可确认的诊断和主要病历记录。",
     "梳理检查与检验": "请梳理当前就诊中已有的检查和检验项目，并说明不能可靠配对的部分。",
     "列出临床时间轴": "请列出当前就诊的结构化临床时间轴。",
-    "运行心脏破裂预测": "请调用心脏破裂二分类模型，判断当前就诊资料对应的患者是否会发生心脏破裂，并列出模型依据。模型未提供概率或具体发生时间时请明确说明。",
+    "运行心脏破裂预测": "请调用心脏破裂预测模型，判断患者未来14天是否发生心脏破裂及当前危急度，并列出核心依据。",
 }
 
 
@@ -162,85 +176,266 @@ def _open_detail(encounter_key: str) -> None:
     navigate_to_patient_page("病情详情", encounter_key)
 
 
+def _encounter_history(encounter_key: str) -> list[dict]:
+    histories = st.session_state.setdefault("chat_history", {})
+    if encounter_key not in histories:
+        histories[encounter_key] = load_encounter_chat(encounter_key)
+    return histories[encounter_key]
+
+
 def _submit_question(encounter_key: str, question: str) -> None:
-    history_by_scope = st.session_state.setdefault("chat_history", {})
-    history = history_by_scope.setdefault(encounter_key, [])
+    question = str(question or "").strip()
+    if not question:
+        return
+    pending = st.session_state.setdefault("pending_agent_questions", {})
+    if encounter_key in pending:
+        return
+    history = _encounter_history(encounter_key)
     prior = list(history)
-    history.append({"role": "user", "content": question})
-    events: list[dict] = []
-    with st.spinner("正在核对当前就诊资料并调用所需模型…"):
-        response = ClinicalReActAgent().run(
-            encounter_key,
-            question,
-            history=prior,
-            event_callback=events.append,
+    message = {"role": "user", "content": question}
+    history.append(message)
+    append_chat_message(encounter_key, message)
+    pending[encounter_key] = {"question": question, "history": prior}
+
+
+def _clear_history(encounter_key: str) -> None:
+    st.session_state.setdefault("chat_history", {})[encounter_key] = []
+    st.session_state.setdefault("pending_agent_questions", {}).pop(encounter_key, None)
+    clear_encounter_chat(encounter_key)
+
+
+def _run_pending_question(encounter_key: str) -> None:
+    pending_map = st.session_state.setdefault("pending_agent_questions", {})
+    pending = pending_map.pop(encounter_key, None)
+    if not pending:
+        return
+
+    history = _encounter_history(encounter_key)
+    question = str(pending.get("question") or "").strip()
+    prior_history = list(pending.get("history") or [])
+    steps: list[dict] = []
+    step_indexes: dict[tuple[object, ...], int] = {}
+    risk_output = ""
+    streamed_thinking = ""
+    final_output = ""
+
+    with st.chat_message("assistant", avatar=":material/clinical_notes:"):
+        status_box = st.status("正在分析当前问题…", expanded=True)
+        with status_box:
+            process_slot = st.empty()
+        final_slot = st.empty()
+
+        def update_step(
+            key: tuple[object, ...],
+            title: str,
+            *,
+            detail: str | None = None,
+            thinking: str | None = None,
+            answer: str | None = None,
+            fields: dict | None = None,
+            status: str | None = None,
+        ) -> None:
+            if key not in step_indexes:
+                step_indexes[key] = len(steps)
+                steps.append({"title": title})
+            step = steps[step_indexes[key]]
+            step["title"] = title
+            if detail is not None:
+                step["detail"] = detail
+            if thinking is not None:
+                step["thinking"] = thinking
+            if answer is not None:
+                step["answer"] = answer
+            if fields is not None:
+                step["fields"] = fields
+            if status is not None:
+                step["status"] = status
+            process_slot.markdown(timeline_html(steps), unsafe_allow_html=True)
+
+        def tool_step_key(tool: str) -> tuple[object, ...]:
+            return next(
+                (key for key in reversed(step_indexes) if key[-1:] == (tool,)),
+                ("tool", 0, tool),
+            )
+
+        def on_event(event: dict) -> None:
+            nonlocal risk_output, streamed_thinking, final_output
+            event_type = str(event.get("type") or "")
+            if event_type == "phase":
+                phase = str(event.get("phase") or "")
+                iteration = event.get("iteration", 0)
+                tool = str(event.get("tool") or "")
+                if phase == "Reason":
+                    update_step(
+                        ("Reason", iteration),
+                        str(event.get("title") or "明确查询内容"),
+                        detail=str(event.get("detail") or "正在确定本次需要读取的资料。"),
+                    )
+                elif phase == "Act":
+                    update_step(
+                        ("tool", iteration, tool),
+                        TOOL_LABELS.get(tool, "读取相关资料"),
+                        detail=str(event.get("detail") or "正在读取并核对相关资料。"),
+                    )
+                elif phase == "Observation":
+                    update_step(
+                        ("tool", iteration, tool),
+                        TOOL_LABELS.get(tool, "读取相关资料"),
+                        detail=str(event.get("label") or "已取得所需资料。"),
+                        status=str(event.get("status") or "success"),
+                    )
+                elif phase == "Final":
+                    update_step(
+                        ("Final",),
+                        str(event.get("title") or "整理回答"),
+                        detail=str(event.get("detail") or "正在整理已获得的信息。"),
+                    )
+            elif event_type == "risk_retry":
+                update_step(
+                    tool_step_key("calculate_risk"),
+                    TOOL_LABELS["calculate_risk"],
+                    detail="预测服务暂时未响应，正在尝试备用服务。",
+                )
+            elif event_type == "risk_think_delta":
+                streamed_thinking += str(event.get("delta") or "")
+                update_step(
+                    tool_step_key("calculate_risk"),
+                    TOOL_LABELS["calculate_risk"],
+                    thinking=streamed_thinking.strip(),
+                )
+            elif event_type == "risk_delta":
+                risk_output += str(event.get("delta") or "")
+                thinking = partial_model_thinking(risk_output)
+                answer = partial_model_answer(risk_output)
+                if (thinking and not streamed_thinking) or answer:
+                    update_step(
+                        tool_step_key("calculate_risk"),
+                        TOOL_LABELS["calculate_risk"],
+                        thinking=thinking if not streamed_thinking else None,
+                        answer=answer or None,
+                    )
+            elif event_type == "risk_complete":
+                thinking = str(event.get("thinking") or "").strip()
+                answer = str(event.get("answer") or "").strip()
+                fields = event.get("fields") if isinstance(event.get("fields"), dict) else {}
+                if thinking or answer:
+                    update_step(
+                        tool_step_key("calculate_risk"),
+                        TOOL_LABELS["calculate_risk"],
+                        thinking=thinking or None,
+                        answer=answer or None,
+                        fields=fields,
+                    )
+            elif event_type == "final_delta":
+                final_output += str(event.get("delta") or "")
+                if final_output.strip():
+                    final_slot.markdown(final_output + " ▌")
+
+        try:
+            response = ClinicalReActAgent().run(
+                encounter_key,
+                question,
+                history=prior_history,
+                event_callback=on_event,
+            )
+        except Exception as exc:
+            response = {
+                "content": f"当前无法完成辅助诊断：{type(exc).__name__}",
+                "sources": [],
+                "trace": [],
+                "mode": "react-unavailable",
+                "reasoning": {"duration_seconds": 0, "trace": [], "risk_runs": []},
+            }
+
+        duration = float(response.get("reasoning", {}).get("duration_seconds") or 0)
+        failed = response.get("mode") == "react-unavailable"
+        status_box.update(
+            label=(
+                f"分析中断（用时 {duration:.1f} 秒）"
+                if failed
+                else f"已思考（用时 {duration:.1f} 秒）"
+            ),
+            state="error" if failed else "complete",
+            expanded=False,
         )
-    response["events"] = events
+        final_slot.markdown(str(response.get("content") or "当前没有可展示的回答。"))
+
     risk_runs = response.get("reasoning", {}).get("risk_runs", [])
     if risk_runs:
         st.session_state.setdefault("latest_model_predictions", {})[
             encounter_key
         ] = risk_runs[-1]
-    history.append({"role": "assistant", **response})
+    message = {"role": "assistant", **response}
+    history.append(message)
+    append_chat_message(encounter_key, message)
+
+
+def _render_reasoning(message: dict) -> None:
+    steps = restored_timeline_steps(message)
+    if not steps:
+        return
+    duration = float((message.get("reasoning") or {}).get("duration_seconds") or 0)
+    with st.expander(f"已思考（用时 {duration:.1f} 秒）", expanded=False):
+        st.markdown(timeline_html(steps), unsafe_allow_html=True)
+
+
+def _render_message(message: dict) -> None:
+    role = str(message.get("role") or "assistant")
+    avatar = ":material/clinical_notes:" if role == "assistant" else None
+    with st.chat_message(role, avatar=avatar):
+        if role == "assistant":
+            _render_reasoning(message)
+        st.markdown(str(message.get("content") or "暂无回答"))
+        if role == "assistant":
+            source_html = source_strip_html(message.get("sources") or [])
+            if source_html:
+                st.markdown(source_html, unsafe_allow_html=True)
 
 
 def _render_chat(encounter_key: str, profile: dict) -> None:
-    st.subheader(":material/clinical_notes: Agent 辅助问答")
+    inject_react_chat_styles()
+    st.subheader(":material/clinical_notes: 辅助诊断记录")
     st.caption(
         f"当前就诊：{profile['regno']}｜{profile['admno']}。"
-        "回答仅核对当前就诊的工作簿资料；模型不可用时会明确说明。"
+        "回答基于当前就诊资料；模型不可用时会明确说明。"
     )
-    history = st.session_state.setdefault("chat_history", {}).setdefault(encounter_key, [])
+    history = _encounter_history(encounter_key)
     if not history:
-        with st.container(
-            key="agent_empty_prompt",
-            height="stretch",
-            gap="small",
-        ):
+        with st.container(key="agent_empty_prompt", height="stretch", gap="small"):
             st.html(
                 """
                 <div class="agent-empty-state">
-                  <span class="agent-empty-icon" aria-hidden="true">✚</span>
+                  <span class="agent-empty-icon" aria-hidden="true">诊</span>
                   <strong>需要核对什么？</strong>
                   <span>选择下方常用问题，或在底部输入需要核对的内容。</span>
                 </div>
                 """
             )
             suggestion_columns = st.columns(2, gap="small")
-            selected_question = None
-            for index, (label, question) in enumerate(SUGGESTIONS.items()):
+            for index, (label, suggestion) in enumerate(SUGGESTIONS.items()):
                 if suggestion_columns[index % 2].button(
                     label,
                     icon=":material/arrow_outward:",
                     width="stretch",
                     key=f"agent_suggestion_{index}_{encounter_key}",
                 ):
-                    selected_question = question
-        if selected_question:
-            _submit_question(encounter_key, selected_question)
-            st.rerun()
+                    _submit_question(encounter_key, suggestion)
+                    st.rerun()
     else:
         for message in history:
-            role = message.get("role", "assistant")
-            with st.chat_message(role, avatar=":material/clinical_notes:" if role == "assistant" else None):
-                st.write(message.get("content") or "暂无回答")
-                if role == "assistant" and message.get("sources"):
-                    st.caption("来源：" + "｜".join(str(item) for item in message["sources"]))
-                if role == "assistant" and message.get("trace"):
-                    with st.expander("查看资料核对过程", icon=":material/fact_check:"):
-                        for step in message["trace"]:
-                            status = "完成" if step.get("status") == "success" else "未完成"
-                            st.markdown(
-                                f"**{step.get('tool', '资料工具')} · {status}**  "
-                                f"{step.get('observation', '暂无过程摘要')}"
-                            )
-        if st.button(
-            "清空当前就诊问答",
-            icon=":material/delete_sweep:",
-            key=f"clear_chat_{encounter_key}",
-        ):
-            st.session_state["chat_history"][encounter_key] = []
-            st.rerun()
+            _render_message(message)
+
+    if encounter_key in st.session_state.setdefault("pending_agent_questions", {}):
+        _run_pending_question(encounter_key)
+
+    if history and st.button(
+        "清空当前就诊问答",
+        icon=":material/delete_sweep:",
+        key=f"clear_chat_{encounter_key}",
+        on_click=_clear_history,
+        args=(encounter_key,),
+    ):
+        st.rerun()
 
     question = st.chat_input(
         "输入需要核对的问题…",
@@ -366,13 +561,14 @@ def render() -> None:
                         normalized = normalize_live_prediction(live_result or {})
                         if normalized["available"]:
                             st.markdown(
-                                f"<div class='risk-legend'><strong>模型风险状态</strong>"
+                                f"<div class='risk-legend'><strong>模型预测</strong>"
                                 f"{risk_badge(normalized['risk_level'])}"
-                                f"<span>预测时间窗：{normalized['prediction_time']}｜"
-                                f"证据支持度：{normalized['evidence_confidence']}</span></div>",
+                                f"<span>破裂判断：{normalized['rupture_judgment']}｜"
+                                f"当前危急度：{normalized['current_urgency'] or '模型未提供'}</span></div>",
                                 unsafe_allow_html=True,
                             )
-                            st.caption(normalized["notice"])
+                            if normalized["core_evidence"]:
+                                st.caption(normalized["core_evidence"])
                         else:
                             st.markdown(
                                 f"<div class='risk-legend'><strong>风险状态</strong>"

@@ -12,14 +12,22 @@ RiskEventCallback = Callable[[dict[str, Any]], None]
 
 
 RISK_SYSTEM_PROMPT = """
-你是一位顶尖的心血管专家。请基于提供的精简病历摘要，首先明确给出关于“是否发生心脏破裂”的预测结论，接着分析风险因素及病理机制。
+你是一个用于医学研究的心血管急症风险预测模型。请只根据用户提供的预测截止日及此前临床事实，独立判断患者未来14天内是否发生心脏破裂，并独立判断截止日当时是否处于危急状态。
 
-必须遵守：
-1. 仅使用输入中的预测截点前资料，不得补充未提供的症状、检查、诊断、治疗或结局。
-2. 缺失信息表示未知，不能视为正常或阴性。
-3. 回顾性 label、病例分组、患者标识和预测截点后结局不得参与预测。
-4. 第一行只能是“【预测结论】 会发生心脏破裂”或“【预测结论】 未发生心脏破裂”，随后再给出依据。
-5. 该模型只输出二分类结论和解释，没有经过校准的发生概率，也不输出具体破裂日期或时间窗。
+先判断现有证据是充分、有限还是不足：证据充分或有限时可以回答“是”或“否”；资料极少、主要为非特异表现、关键事实矛盾，或任一方向都主要依赖猜测时，必须回答“证据不足”。缺失信息代表未知，不能自动当作阴性；一般危重表现也不能自动等同于心脏破裂。只能使用输入中的临床事实，不得补充不存在的信息，不得把相关性写成已证实因果，并应考虑合理的非破裂替代解释。
+
+“未来14天是否破裂”和“当前危急度”是两个独立维度。当前危急不等于一定破裂，当前暂时稳定也不等于未来不会破裂。即使破裂判断为证据不足，仍须判断当前危急度。
+
+输出必须严格采用以下八行结构，不增加其他标题、标签或文字：
+
+<think>
+关键证据：输入中真正影响判断的1至3项事实。
+综合判断：说明支持因素、反向因素及合理替代解释。
+不确定性：说明缺少的信息以及现有证据是否足以判断。
+</think>
+<answer>
+破裂判断：是/否/证据不足；当前危急度：危急/暂时稳定；核心依据：……
+</answer>
 """.strip()
 
 
@@ -77,9 +85,24 @@ def parse_risk_output(raw_output: str) -> dict[str, Any]:
 
     thinking, has_think_tag = last_tag("think")
     answer, has_answer_tag = last_tag("answer")
+    # Some Qwen/vLLM streams expose the opening think marker through a
+    # reasoning channel but leave only an orphan </think> in content. Split
+    # that real-world format before applying the ordinary fallback parser.
+    if not has_think_tag and re.search(r"</think>", raw, flags=re.I):
+        thinking_part, answer_part = re.split(
+            r"</think>",
+            raw,
+            maxsplit=1,
+            flags=re.I,
+        )
+        thinking = re.sub(r"^\s*<think>\s*", "", thinking_part, flags=re.I).strip()
+        if not has_answer_tag:
+            answer = re.sub(r"</?answer>", "", answer_part, flags=re.I).strip()
+        has_think_tag = bool(thinking)
     if not has_answer_tag:
-        answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.I | re.S)
-        answer = re.sub(r"</?answer>", "", answer, flags=re.I).strip()
+        if not answer:
+            answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.I | re.S)
+            answer = re.sub(r"</?answer>", "", answer, flags=re.I).strip()
     if not thinking:
         before_answer = re.split(r"<answer>", raw, maxsplit=1, flags=re.I)[0]
         thinking = re.sub(r"</?think>", "", before_answer, flags=re.I).strip()
@@ -95,9 +118,31 @@ def parse_risk_output(raw_output: str) -> dict[str, Any]:
         if match:
             fields[key] = match.group(1).strip()
 
-    # The uploaded fine-tuned Qwen model was trained with a binary conclusion
-    # header instead of structured rupture_* fields. Parse that exact contract
-    # without inferring a probability, confidence score, or event time.
+    trained_contract = re.search(
+        r"破裂判断\s*[:：]\s*(是|否|证据不足)\s*[；;]\s*"
+        r"当前危急度\s*[:：]\s*(危急|暂时稳定)\s*[；;]\s*"
+        r"核心依据\s*[:：]\s*(.+)",
+        answer,
+        flags=re.S,
+    )
+    if trained_contract:
+        rupture_judgment, current_urgency, core_evidence = (
+            item.strip() for item in trained_contract.groups()
+        )
+        fields.update(
+            {
+                "rupture_judgment": rupture_judgment,
+                "current_urgency": current_urgency,
+                "core_evidence": core_evidence,
+                "explanation": core_evidence,
+            }
+        )
+        if rupture_judgment == "是":
+            fields["rupture_label"] = "1"
+        elif rupture_judgment == "否":
+            fields["rupture_label"] = "0"
+
+    # Keep backward compatibility with older binary-only model responses.
     if "rupture_label" not in fields:
         if "未发生心脏破裂" in answer:
             fields["rupture_label"] = "0"
@@ -278,8 +323,17 @@ class CardiacRuptureRiskModel:
                     callback,
                 )
                 parsed = parse_risk_output(raw_output)
-                if not parsed["answer"] or parsed["fields"].get("rupture_label") not in {"0", "1"}:
-                    raise ValueError("模型未返回可解析的心脏破裂二分类结论")
+                rupture_judgment = parsed["fields"].get("rupture_judgment")
+                valid_trained_contract = (
+                    rupture_judgment in {"是", "否", "证据不足"}
+                    and parsed["fields"].get("current_urgency")
+                    in {"危急", "暂时稳定"}
+                )
+                valid_legacy_contract = parsed["fields"].get("rupture_label") in {"0", "1"}
+                if not parsed["answer"] or not (
+                    valid_trained_contract or valid_legacy_contract
+                ):
+                    raise ValueError("模型未返回可解析的破裂判断和当前危急度")
                 duration = round(time.monotonic() - started_at, 2)
                 actual_source = "心脏破裂预测模型"
                 result = {
@@ -305,6 +359,7 @@ class CardiacRuptureRiskModel:
                         "duration_seconds": duration,
                         "thinking": parsed["thinking"],
                         "answer": parsed["answer"],
+                        "fields": parsed["fields"],
                     },
                 )
                 return result

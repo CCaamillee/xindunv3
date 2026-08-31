@@ -33,6 +33,11 @@ def normalize_live_prediction(result: dict[str, Any]) -> dict[str, Any]:
     """Normalize one real model response for display without inferring missing fields."""
     prediction = result.get("prediction") or {}
     fields = prediction.get("fields") or result
+    rupture_judgment = str(fields.get("rupture_judgment") or "").strip()
+    current_urgency = str(fields.get("current_urgency") or "").strip()
+    core_evidence = str(
+        fields.get("core_evidence") or fields.get("explanation") or ""
+    ).strip()
     raw_label = str(
         fields.get("rupture_label")
         if fields.get("rupture_label") is not None
@@ -59,24 +64,40 @@ def normalize_live_prediction(result: dict[str, Any]) -> dict[str, Any]:
         predicted_label = 0
     else:
         predicted_label = None
+    if rupture_judgment == "是":
+        predicted_label = 1
+    elif rupture_judgment == "否":
+        predicted_label = 0
+    elif rupture_judgment == "证据不足":
+        predicted_label = None
+    elif predicted_label == 1:
+        rupture_judgment = "是"
+    elif predicted_label == 0:
+        rupture_judgment = "否"
     normalized_record = {
         "predicted_label": predicted_label,
         "predicted_evidence_confidence": confidence,
     }
-    risk_level = _risk_level(normalized_record) or "UNKNOWN"
+    if current_urgency == "危急":
+        risk_level = "HIGH"
+    elif current_urgency == "暂时稳定":
+        risk_level = "LOW"
+    else:
+        risk_level = _risk_level(normalized_record) or "UNKNOWN"
     is_available = bool(
         result.get("available", result.get("parse_ok", False))
-        and predicted_label is not None
+        and rupture_judgment in {"是", "否", "证据不足"}
     )
     classification_label = (
-        "预测阳性（建议重点复核）"
-        if predicted_label == 1
-        else "预测阴性"
-        if predicted_label == 0
+        f"破裂判断：{rupture_judgment}"
+        if rupture_judgment
         else "无法判断"
     )
     return {
         "available": is_available,
+        "rupture_judgment": rupture_judgment,
+        "current_urgency": current_urgency,
+        "core_evidence": core_evidence,
         "risk_level": risk_level,
         "risk_label": RISK_LABELS[risk_level],
         "classification_label": classification_label,
@@ -87,16 +108,13 @@ def normalize_live_prediction(result: dict[str, Any]) -> dict[str, Any]:
             raw_window or "模型未提供具体发生时间",
         ),
         "evidence_confidence": confidence or "模型未提供",
-        "explanation": str(
-            fields.get("explanation") or result.get("model_explanation") or ""
-        ).strip(),
+        "explanation": core_evidence or str(result.get("model_explanation") or "").strip(),
         "answer": str(
             prediction.get("answer") or result.get("model_answer") or ""
         ).strip(),
         "model": str(result.get("model") or "").strip(),
         "duration_seconds": result.get("duration_seconds"),
-        "notice": str(result.get("notice") or "").strip()
-        or "该结果是模型二分类输出，不代表校准后的发生概率，且不提供具体发生时间。",
+        "notice": str(result.get("notice") or "").strip(),
     }
 
 

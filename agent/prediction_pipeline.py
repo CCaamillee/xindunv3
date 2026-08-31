@@ -28,6 +28,9 @@ def _model_output(result: dict[str, Any]) -> dict[str, Any]:
     prediction = result.get("prediction") or {}
     fields = prediction.get("fields") or {}
     return {
+        "rupture_judgment": fields.get("rupture_judgment"),
+        "current_urgency": fields.get("current_urgency"),
+        "core_evidence": fields.get("core_evidence"),
         "rupture_label": fields.get("rupture_label"),
         "rupture_time_window": fields.get("rupture_time_window"),
         "evidence_confidence": fields.get("evidence_confidence"),

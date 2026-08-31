@@ -14,7 +14,7 @@ from services.database import get_display_id_salt
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OVERVIEW_PATH = PROJECT_ROOT / "clean_非破裂完整版（15天窗口）.xlsx"
+DEFAULT_OVERVIEW_PATH = PROJECT_ROOT / "clean_心脏破裂完整版（15天窗口）.xlsx"
 DIAGNOSIS_COLUMNS = (
     "入院诊断",
     "首页门急诊诊断",

@@ -30,20 +30,22 @@ Repeat or Final：证据不足时继续 Reason → Act → Observation；证据�
 工具边界：
 1. get_patient_timeline：读取当前就诊记录的真实时间病程时间轴。
 2. extract_clinical_features：读取当前患者的结构化特征、支持依据、反向依据和数据缺口。
-3. calculate_risk：调用本机心脏破裂垂直模型，根据当前患者预测截点前的脱敏资料，返回未来14天是否发生心脏破裂、可能时间窗、模型依据与不确定性。
-4. knowledge_search：当存在不清楚或不确定的医学知识时，生成清晰、独立的医学知识 query 后调用。
+3. calculate_risk：调用本机心脏破裂垂直模型，根据当前患者预测截点前的脱敏资料，独立返回未来14天破裂判断、当前危急度和核心依据。
+4. knowledge_search：仅当你明确无法解释某个具体医学术语或机制时，生成清晰、独立的医学知识 query 后调用。
 
 必须遵守：
 1. 回答患者相关问题前必须先调用相关工具，不能只根据用户描述或一般医学知识回答。
 2. 患者事实只能来自 get_patient_timeline 或 extract_clinical_features 的 Observation；calculate_risk 返回的是模型预测，不得改写为已经发生的事实。
 3. knowledge_search 返回的是模型生成的通用医学知识，不是患者事实，也不是文献检索结果。
-4. 用户询问是否会发生心脏破裂、预测标签、发生时间窗、风险等级、证据支持度或其他心脏破裂预测指标时，必须先调用 extract_clinical_features 核对预测截点前资料，再调用 calculate_risk；不得自行生成或替代预测模型结果。
+4. 用户询问是否会发生心脏破裂、当前是否危急或其他专病预测指标时，必须先调用 extract_clinical_features 核对预测截点前资料，再调用 calculate_risk；不得自行生成或替代预测模型结果。
 5. 工具返回缺失、未知、无法配对或错误时，必须保留该不确定性，不得自行补齐。
 6. 不得输出隐藏思维过程或工具未返回的患者事实；患者与就诊标识不发送给模型。
-7. 不生成具体医嘱、药物剂量或手术决定；最终判断需要医生结合完整病历复核。
+7. 不生成具体药物剂量或手术决定；资料存在缺口时，用临床语言指出需要关注或补充的资料。
 8. 同一条就诊同一轮问答中，每个患者资料工具和 calculate_risk 最多执行一次；已有有效 Observation 后必须复用。
-9. calculate_risk 的 <answer> 是预测模型的最终输出，应忠实保留其中的预测标签、时间窗和证据支持度；<think> 只放在可折叠推理记录中，不要混入最终回答。
-10. 最终回答应简洁说明结论、依据、缺失信息以及知识来源边界，并明确预测结果仅供临床辅助复核。
+9. calculate_risk 的 <answer> 是预测模型的最终输出，应忠实保留其中的破裂判断、当前危急度和核心依据；<think> 只放在可折叠推理记录中，不要混入最终回答。
+10. 最终回答面向医生，简洁说明结论、主要依据和需关注信息；不要输出模型开发说明、通用免责声明、内部计划或“需要向用户说明”等元话语。
+11. 普通的资料缺失、预测不确定性、反向证据、替代病因、鉴别诊断或证据冲突均不构成 knowledge_search 调用理由；每轮最多调用一次。
+12. 是否调用工具必须由你结合用户语义和已有 Observation 判断，不依赖固定关键词；决定调用时必须使用 API 原生 function tool call，不得在 content 中输出 Reason、Act、<function_calls>、<invoke> 或工具调用代码。
 """.strip()
 
 
@@ -102,8 +104,9 @@ REACT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "calculate_risk",
             "description": (
-                "调用心脏破裂垂直模型预测当前患者未来14天是否发生心脏破裂。"
-                "当问题涉及心脏破裂预测、风险等级、预测标签、发生时间窗或证据支持度时必须调用。"
+                "调用心脏破裂垂直模型，独立判断当前患者未来14天是否发生心脏破裂，"
+                "并判断预测截止日当时处于危急还是暂时稳定状态。"
+                "当问题涉及心脏破裂预测或当前危急度时调用。"
             ),
             "parameters": {
                 "type": "object",
@@ -118,7 +121,8 @@ REACT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "knowledge_search",
             "description": (
-                "当推理中出现不清楚或不确定的医学知识点时调用。"
+                "仅当模型明确不知道某个具体医学术语、机制或知识点时调用。"
+                "资料缺失、预测不确定、反向证据和鉴别诊断不应触发。"
                 "请生成脱离患者身份信息的独立医学知识查询。"
             ),
             "parameters": {
@@ -162,7 +166,15 @@ def _parse_arguments(raw_arguments: Any) -> dict[str, Any]:
 
 def _sanitize_tool_result_for_model(value: Any) -> Any:
     """Remove stable patient/encounter identifiers before a tool result reaches a model."""
-    blocked = {"patient_id", "regno", "admno", "encounter_key"}
+    blocked = {
+        "patient_id",
+        "regno",
+        "admno",
+        "encounter_key",
+        "endpoint",
+        "failed_endpoints",
+        "model",
+    }
     if isinstance(value, dict):
         return {
             key: _sanitize_tool_result_for_model(item)
@@ -187,20 +199,109 @@ def _emit(callback: AgentEventCallback | None, event: dict[str, Any]) -> None:
         return
 
 
-def _requires_risk_prediction(question: str) -> bool:
-    normalized = str(question or "").lower()
+def _requires_timeline(question: str) -> bool:
+    normalized = str(question or "")
+    return any(term in normalized for term in ("时间轴", "时间线", "病程变化", "如何变化"))
+
+
+def _question_analysis_summary(
+    question: str,
+    observations: list[dict[str, Any]],
+) -> tuple[str, str]:
+    completed_tools = {
+        item.get("tool")
+        for item in observations
+        if not item.get("result", {}).get("error")
+    }
+    if "calculate_risk" in completed_tools:
+        return (
+            "核对预测结果",
+            "已取得专病预测结果，正在核对预测结论、主要依据和需要关注的资料缺口。",
+        )
+    if "extract_clinical_features" in completed_tools:
+        return (
+            "判断下一步",
+            "已整理当前就诊的临床资料，正在判断是否还需病程时间轴、专病预测或医学知识补充。",
+        )
+    if "get_patient_timeline" in completed_tools:
+        return (
+            "判断下一步",
+            "已读取病程时间轴，正在判断现有记录是否足以回答问题或仍需补充其他资料。",
+        )
+    if _requires_timeline(question):
+        return (
+            "明确查询内容",
+            "本次需要梳理当前就诊的病程和检查变化，先读取可靠时间轴记录。",
+        )
+    normalized = str(question or "")
+    if any(term in normalized for term in ("资料", "缺口", "质量", "对齐")):
+        return (
+            "明确查询内容",
+            "本次需要检查当前就诊资料的完整性、字段来源和时间对齐情况。",
+        )
+    return (
+        "明确查询内容",
+        "正在识别医生关注的是病历事实、病程变化、专病预测还是医学知识，并选择相应资料。",
+    )
+
+
+def _final_step_title(question: str, has_risk_prediction: bool) -> str:
+    if has_risk_prediction:
+        return "整理预测结果"
+    normalized = str(question or "")
+    if any(term in normalized for term in ("资料", "缺口", "质量", "对齐")):
+        return "整理资料情况"
+    if _requires_timeline(question) or any(
+        term in normalized for term in ("症状", "生命体征", "循环", "检验", "影像")
+    ):
+        return "整理病情变化"
+    return "整理回答"
+
+
+def _final_step_summary(
+    question: str,
+    has_risk_prediction: bool,
+    observations: list[dict[str, Any]],
+) -> str:
+    if has_risk_prediction:
+        risk_result = next(
+            (
+                item.get("result", {})
+                for item in observations
+                if item.get("tool") == "calculate_risk"
+                and not item.get("result", {}).get("error")
+            ),
+            {},
+        )
+        prediction = risk_result.get("prediction") or {}
+        fields = prediction.get("fields") or {}
+        rupture = str(fields.get("rupture_judgment") or "").strip()
+        urgency = str(fields.get("current_urgency") or "").strip()
+        if rupture and urgency:
+            return f"模型破裂判断为{rupture}、当前危急度为{urgency}，正在整理核心依据。"
+        label = str(fields.get("rupture_label") or "").strip()
+        conclusion = {"1": "会发生心脏破裂", "0": "未发生心脏破裂"}.get(
+            label,
+            "已取得专病模型结果",
+        )
+        return f"模型结果为{conclusion}，正在整理核心依据。"
+    if _requires_timeline(question):
+        return "已读取当前就诊时间轴，正在整理病程和检查变化。"
+    if any(term in str(question or "") for term in ("资料", "缺口", "质量", "对齐")):
+        return "已读取当前就诊资料，正在整理字段来源和资料缺口。"
+    return "已读取当前问题所需资料，正在整理回答。"
+
+
+def _contains_textual_tool_call(content: str) -> bool:
+    """Reject tool protocol text that should have arrived as a native tool call."""
+    normalized = str(content or "").lower()
     return any(
-        term in normalized
-        for term in (
-            "心脏破裂",
-            "是否破裂",
-            "破裂风险",
-            "风险预测",
-            "预测标签",
-            "发生时间窗",
-            "预测时间窗",
-            "证据支持度",
-            "rupture",
+        marker in normalized
+        for marker in (
+            "<function_calls",
+            "</function_calls",
+            "<invoke ",
+            "</invoke>",
         )
     )
 
@@ -225,11 +326,7 @@ def _observation_summary(tool_name: str, result: dict[str, Any]) -> str:
         answer = " ".join(str(prediction.get("answer") or "").split())
         if len(answer) > 110:
             answer = answer[:110] + "…"
-        return (
-            f"心脏破裂垂直模型已在 {result.get('endpoint', '本地服务')} 完成预测"
-            f"（{result.get('duration_seconds', 0)} 秒）"
-            + (f"：{answer}" if answer else "。")
-        )
+        return "心脏破裂预测模型已完成本次预测" + (f"：{answer}" if answer else "。")
     if tool_name == "knowledge_search":
         return (
             f"已由 {result.get('model', KNOWLEDGE_MODEL)} 返回通用医学知识说明；"
@@ -370,19 +467,35 @@ class ClinicalReActAgent:
         client: Any,
         messages: list[dict[str, Any]],
         callback: AgentEventCallback | None,
+        has_risk_prediction: bool,
     ) -> str:
+        if has_risk_prediction:
+            final_instruction = (
+                "工具读取已经结束。只基于以上 Observation，直接向医生给出最终结果。"
+                "不要输出内部计划、<think>、Reason、Act、Observation、工具名或“需要向用户说明”等元话语。"
+                "使用以下临床表达：\n"
+                "破裂判断：原样写出是、否或证据不足。\n"
+                "当前危急度：原样写出危急或暂时稳定，不得根据破裂判断自行推断。\n"
+                "核心依据：用1至3句话忠实概括工具返回的核心依据。\n"
+                "需关注：仅在资料缺失或结论存在明显限制时，用一句话指出医生需要关注或补充的资料。\n"
+                "忠实保留 calculate_risk 的两个独立判断，不得自行反转、补造概率、置信度或时间窗。"
+                "不要展示 rupture_label 等程序字段。"
+                "不要写“辅助输出、并非确诊、概率校准、仅供参考、最终判断需要医生复核”等通用免责声明。"
+            )
+        else:
+            final_instruction = (
+                "工具读取已经结束。只基于以上 Observation，直接回答医生的问题。"
+                "不要输出内部计划、<think>、Reason、Act、Observation、工具名、数据处理过程、"
+                "“需要向用户说明”等元话语，也不要追加通用免责声明或继续提问邀请。"
+                "按临床工作场景简洁表达；资料不足时只指出具体缺少的内容。"
+            )
         response = client.chat.completions.create(
             model=self.settings.model,
             messages=[
                 *messages,
                 {
                     "role": "user",
-                    "content": (
-                        "工具调用已经完成。现在不再调用工具，只基于以上 Observation 生成最终回答。"
-                        "如果 calculate_risk 已返回结果，应忠实保留其二分类预测结论和解释；"
-                        "模型未提供概率、置信度或具体发生时间时必须明确写暂无，不得补造。"
-                        "最后说明该结果仅供临床辅助复核。"
-                    ),
+                    "content": final_instruction,
                 },
             ],
             temperature=0.1,
@@ -448,28 +561,117 @@ class ClinicalReActAgent:
         observations: list[dict[str, Any]] = []
         sources: set[str] = set()
         started_at = time.monotonic()
-        risk_required = scope_id != COHORT_SCOPE_ID and _requires_risk_prediction(
-            normalized_question
-        )
-        context_required = scope_id != COHORT_SCOPE_ID and self._risk_predictor is None
 
         try:
             client = self._get_client()
+
+            def finalize(
+                iteration: int,
+            ) -> dict[str, Any]:
+                has_risk_prediction = any(
+                    item["tool"] == "calculate_risk"
+                    and item.get("result", {}).get("prediction")
+                    for item in observations
+                )
+                final_title = _final_step_title(
+                    normalized_question,
+                    has_risk_prediction,
+                )
+                final_summary = _final_step_summary(
+                    normalized_question,
+                    has_risk_prediction,
+                    observations,
+                )
+                react_steps.append(
+                    {
+                        "phase": "Final",
+                        "iteration": iteration,
+                        "title": final_title,
+                        "summary": final_summary,
+                    }
+                )
+                _emit(
+                    event_callback,
+                    {
+                        "type": "phase",
+                        "phase": "Final",
+                        "iteration": iteration,
+                        "title": final_title,
+                        "detail": final_summary,
+                    },
+                )
+
+                # The no-tool response is only the planner's decision to stop.
+                # Always synthesize a separate physician-facing answer so that
+                # planning notes never leak into the chat output.
+                final_answer = self._stream_final_answer(
+                    client,
+                    messages,
+                    event_callback,
+                    has_risk_prediction,
+                )
+                if not final_answer:
+                    return _error_response("模型没有返回最终回答", trace)
+
+                duration_seconds = round(time.monotonic() - started_at, 2)
+                risk_runs = [
+                    item["result"]
+                    for item in observations
+                    if item["tool"] == "calculate_risk"
+                    and item.get("result", {}).get("prediction")
+                ]
+                result_payload = {
+                    "content": final_answer,
+                    "sources": sorted(source for source in sources if source),
+                    "simulated": False,
+                    "mode": "bailian-react",
+                    "model": self.settings.model,
+                    "knowledge_model": self.knowledge_model,
+                    "trace": trace,
+                    "react_steps": react_steps,
+                    "reasoning": {
+                        "duration_seconds": duration_seconds,
+                        "trace": trace,
+                        "risk_runs": risk_runs,
+                    },
+                    "task_drafts": [],
+                    "validation": {
+                        "status": "completed-after-observation",
+                        "observation_count": len(observations),
+                        "problems": [],
+                    },
+                }
+                _emit(
+                    event_callback,
+                    {
+                        "type": "complete",
+                        "duration_seconds": duration_seconds,
+                        "trace": trace,
+                    },
+                )
+                return result_payload
+
             for iteration in range(1, self.settings.max_iterations + 1):
+                reason_title, reason_detail = _question_analysis_summary(
+                    normalized_question,
+                    observations,
+                )
                 _emit(
                     event_callback,
                     {
                         "type": "phase",
                         "phase": "Reason",
                         "iteration": iteration,
-                        "label": "正在判断需要核对的资料",
+                        "title": reason_title,
+                        "detail": reason_detail,
                     },
                 )
                 react_steps.append(
                     {
                         "phase": "Reason",
                         "iteration": iteration,
-                        "summary": "根据用户问题和已有 Observation 判断下一步；隐藏思维过程不对外输出。",
+                        "title": reason_title,
+                        "summary": reason_detail,
                     }
                 )
                 completion = client.chat.completions.create(
@@ -484,120 +686,37 @@ class ClinicalReActAgent:
                 tool_calls = assistant.tool_calls or []
 
                 if not tool_calls:
-                    if not observations:
+                    assistant_content = str(assistant.content or "").strip()
+                    if _contains_textual_tool_call(assistant_content):
                         messages.append(
-                            {"role": "assistant", "content": assistant.content or ""}
-                        )
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": "尚未获得任何 Observation。请先调用相关工具，再生成最终回答。",
-                            }
-                        )
-                        continue
-
-                    completed_tools = {
-                        item["tool"]
-                        for item in observations
-                        if not item.get("result", {}).get("error")
-                    }
-                    if context_required and "extract_clinical_features" not in completed_tools:
-                        messages.append(
-                            {"role": "assistant", "content": assistant.content or ""}
+                            {"role": "assistant", "content": assistant_content}
                         )
                         messages.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "尚未获得当前就诊预测截点前的临床事实。"
-                                    "请先调用 extract_clinical_features。"
+                                    "你刚才把工具协议写进了正文。请重新判断下一步："
+                                    "需要工具时使用 API 原生 function tool call；"
+                                    "不需要工具时直接给出最终回答，不要输出 Reason、Act 或 XML。"
                                 ),
                             }
                         )
                         continue
-                    if risk_required and "calculate_risk" not in completed_tools:
+                    if not assistant_content:
                         messages.append(
-                            {"role": "assistant", "content": assistant.content or ""}
+                            {"role": "assistant", "content": ""}
                         )
                         messages.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "该问题需要心脏破裂预测指标，但尚未获得 calculate_risk 的有效 Observation。"
-                                    "请先调用 calculate_risk。"
+                                    "请结合用户问题和已有 Observation 自主判断："
+                                    "继续调用所需工具，或直接生成最终回答。"
                                 ),
                             }
                         )
                         continue
-
-                    react_steps.append(
-                        {
-                            "phase": "Final",
-                            "iteration": iteration,
-                            "summary": "基于已获得的 Observation 生成最终回答。",
-                        }
-                    )
-                    _emit(
-                        event_callback,
-                        {
-                            "type": "phase",
-                            "phase": "Final",
-                            "iteration": iteration,
-                            "label": "正在生成最终回答",
-                        },
-                    )
-                    final_answer = self._stream_final_answer(
-                        client,
-                        messages,
-                        event_callback,
-                    )
-                    if not final_answer:
-                        final_answer = (assistant.content or "").strip()
-                        if final_answer:
-                            _emit(
-                                event_callback,
-                                {"type": "final_delta", "delta": final_answer},
-                            )
-                    if not final_answer:
-                        return _error_response("模型没有返回最终回答", trace)
-
-                    duration_seconds = round(time.monotonic() - started_at, 2)
-                    risk_runs = [
-                        item["result"]
-                        for item in observations
-                        if item["tool"] == "calculate_risk"
-                        and item.get("result", {}).get("prediction")
-                    ]
-                    result_payload = {
-                        "content": final_answer,
-                        "sources": sorted(source for source in sources if source),
-                        "simulated": False,
-                        "mode": "bailian-react",
-                        "model": self.settings.model,
-                        "knowledge_model": self.knowledge_model,
-                        "trace": trace,
-                        "react_steps": react_steps,
-                        "reasoning": {
-                            "duration_seconds": duration_seconds,
-                            "trace": trace,
-                            "risk_runs": risk_runs,
-                        },
-                        "task_drafts": [],
-                        "validation": {
-                            "status": "completed-after-observation",
-                            "observation_count": len(observations),
-                            "problems": [],
-                        },
-                    }
-                    _emit(
-                        event_callback,
-                        {
-                            "type": "complete",
-                            "duration_seconds": duration_seconds,
-                            "trace": trace,
-                        },
-                    )
-                    return result_payload
+                    return finalize(iteration)
 
                 messages.append(
                     {
@@ -624,7 +743,10 @@ class ClinicalReActAgent:
                             item["result"]
                             for item in observations
                             if item["tool"] == tool_name
-                            and not item.get("result", {}).get("error")
+                            and (
+                                tool_name == "knowledge_search"
+                                or not item.get("result", {}).get("error")
+                            )
                         ),
                         None,
                     )
@@ -655,7 +777,13 @@ class ClinicalReActAgent:
                             "phase": "Act",
                             "iteration": iteration,
                             "tool": tool_name,
-                            "label": f"正在调用 {tool_name}",
+                            "title": "读取所需资料",
+                            "detail": {
+                                "extract_clinical_features": "正在整理当前就诊的结构化临床资料、字段来源和资料缺口。",
+                                "get_patient_timeline": "正在读取当前就诊的病程时间轴和结构化事件。",
+                                "calculate_risk": "正在调用心脏破裂预测模型并读取模型结果。",
+                                "knowledge_search": "正在补充一个无法直接解释的医学知识点。",
+                            }.get(tool_name, "正在读取相关资料。"),
                         },
                     )
                     result = self._act(
